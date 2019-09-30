@@ -1,100 +1,101 @@
 import pandas as pd
-import requests
-import datetime
-import time
-from math import cos, asin, sqrt
-import numpy as np
+from datetime import datetime, timedelta
+import os
+import json
+from google.cloud import bigquery
 
-pd.set_option('display.max_rows', 1000)
-pd.set_option('display.max_columns', 500)
-pd.set_option('display.width', 1000)
+# formats datetime to string
+def format_datetime(date_time):
+    return date_time.strftime('%Y-%m-%d %H:%M:%S')
 
-def get_parking_data():
-    response = requests.get('https://opendata.arcgis.com/datasets/0060469c57864becb76a036d23236143_0.geojson').json()
-    df = pd.io.json.json_normalize(response['features'])
-    df = df.drop(df.columns[0], axis=1)
-    new_columns = [col.rsplit('.')[1].upper() for col in df.columns.tolist()]
-    df.columns = new_columns
-    df[['LAT','LNG']] = pd.DataFrame(df['COORDINATES'].values.tolist(), index=df.index)
-    df['TIMELIMIT_VIOLATION'] = df['TIMELIMIT'].apply(timelimit_violation)
-    df['PKGTYPE_VIOLATION'] = df['PKGTYPE'].apply(pkgtype_violation)
-    df['NEXT_SWEEPING_PERIOD'] = df.apply(lambda x: next_sweeping_period(x['PKGSDAY'], x['PKGSWBEG'], x['PKGSWEND']), axis=1)
-    df['NEXT_SWEEPING_START'] = df['NEXT_SWEEPING_PERIOD'].apply(lambda x: None if x is None else x[0])
-    df['NEXT_SWEEPING_END'] = df['NEXT_SWEEPING_PERIOD'].apply(lambda x: None if x is None else x[1])
-    df['NEXT_SWEEPING_HOURS'] = df['NEXT_SWEEPING_START'].apply(time_to_sweeping)
-    return df
+# returns week # from datetime
+def get_week_count(day):
+    return (day.day-1) // 7+1
 
-# gets distance between two points, from -> https://stackoverflow.com/questions/41336756/find-the-closest-latitude-and-longitude
-def distance(lat1, lng1, lat2, lng2):
-    p = 0.017453292519943295
-    a = 0.5 - cos((lat2-lat1)*p)/2 + cos(lat1*p)*cos(lat2*p) * (1-cos((lng2-lng1)*p)) / 2
-    return 12742 * asin(sqrt(a))
+# returns string as time
+def parse_time(datetime_string):
+    return datetime.strptime(datetime_string, '%H:%M:%S').time()
 
-# returns the closest point
-def closest(coords, v):
-    return min(coords, key=lambda p: distance(v[0],v[1],p[0],p[1]))
+# returns a schedule
+def get_schedule(name, days, begin, end, weeks = [1,2,3,4,5]):
+    date_list = pd.date_range(datetime.now().date(), periods=100).to_pydatetime().tolist()
+    begin = parse_time(begin)
+    end = parse_time(end)
+    schedules = []
+    for day in date_list:
+        if day.weekday() in days and get_week_count(day) in weeks:
+            begin_date = datetime.combine(day, begin)
+            if begin > end:
+                day += timedelta(days=1)
+            end_date = datetime.combine(day, end)
+            schedules.append({'type': name, 'begin': format_datetime(begin_date), 'end': format_datetime(end_date)})
+    return schedules
 
-# returns date of next street sweeping datetime
-def next_sweeping_date(clean_date):
-    if clean_date is None:
+def string_to_list(string_list):
+    if string_list:
+        return json.loads(string_list)
+    else:
         return None
-    digit = clean_date[0]
-    wkdy = time.strptime(clean_date.split()[-1][:3],"%a").tm_wday
-    now = datetime.datetime.today()
-    next_day = now.date() + datetime.timedelta(days=(wkdy-now.weekday())%7)
-    if not digit.isdigit() or next_day.day < 7:
-        return next_day
-    next_month = pd.datetime(year=now.year, month=now.month + 1, day=1).date()
-    if next_month.weekday() == wkdy:
-        return next_month
-    return next_month.replace(day=(1 + (wkdy - next_month.weekday()) % 7))
 
-# returns start and end datetimes of next street cleaning
-def next_sweeping_period(clean_day, begin, end):
-    clean_date = next_sweeping_date(clean_day)
-    if None in [clean_date, begin, end]:
-        return None
-    start_datetime = datetime.datetime.combine(clean_date, datetime.datetime.strptime(begin, '%I %p').time())
-    end_datetime = datetime.datetime.combine(clean_date, datetime.datetime.strptime(end, '%I %p').time())
-    now = datetime.datetime.today()
-    if now > end_datetime:
-        start_datetime += datetime.timedelta(days=7)
-        end_datetime += datetime.timedelta(days=7)
-    return [start_datetime, end_datetime]
+# returns list of all schedules
+def get_all_schedules(spot):
+    # get different schedules
+    if all(schedule is None for schedule in [spot['parking_days'], spot['sweeping_days'],spot['nopark_days1']]):
+        if spot['time_limit'] == 'No Parking Anytime':
+            return [{'type': 'noparking', 'begin': None, 'end': None}]
+        else:
+            return [{'type': 'unknown', 'begin': None, 'end': None}]
+    if spot['parking_days'] is not None:
+        full_schedule = get_schedule('active', spot['parking_days'], spot['parking_begin'], spot['parking_end'])
+    if spot['sweeping_days'] is not None:
+        full_schedule.extend(get_schedule('sweeping', spot['sweeping_days'], spot['sweeping_begin'], spot['sweeping_end'], spot['sweeping_weeks']))
+    if spot['nopark_days1'] is not None:
+        full_schedule.extend(get_schedule('noparking', spot['nopark_days1'], spot['nopark_begin1'], spot['nopark_end1']))
+    if spot['nopark_begin2'] is not None:
+        if spot['nopark_days2'] is None:
+            full_schedule.extend(get_schedule('noparking', spot['nopark_days1'], spot['nopark_begin2'], spot['nopark_end2']))
+        else:
+            full_schedule.extend(get_schedule('noparking', spot['nopark_days2'], spot['nopark_begin2'], spot['nopark_end2']))
 
-# returns hours to next street sweeping
-def time_to_sweeping(start_datetime):
-    td = start_datetime - datetime.datetime.today()
-    if td < datetime.timedelta(hours=0):
-        return 0
-    return td // pd.Timedelta(hours=1)
+    # sort schedules by time
+    full_schedule.sort(key=lambda x: x['begin'])
+    full_schedule.sort(key=lambda x: x['end'])
+    # correct overlapping periods
+    for index, value in enumerate(full_schedule):
+        if value['type'] is 'active':
+            # this happens to everything but the first schedule
+            if index != 0:
+                if full_schedule[index-1]['end'] > value['begin']:
+                    full_schedule[index]['begin'] = full_schedule[index-1]['end']
+            # this happens to everything but the last schedule
+            if index != len(full_schedule)-1:
+                if full_schedule[index+1]['begin'] < value['end']:
+                    full_schedule[index]['end'] = full_schedule[index+1]['begin']
+    for index, value in enumerate(full_schedule):
+        # if last end does not equal current begin then create open period
+        if full_schedule[index-1]['end'] != value['begin'] and index !=0:
+            full_schedule.insert(index, {'periodType': 'open', 'begin': full_schedule[index-1]['end'], 'end': value['begin']})
+    return full_schedule
 
-# returns True for timelimit violations
-def timelimit_violation(limit):
-    if limit in ['No Parking Anytime', '30 Minutes', '5 Minutes', '1 Hour', '15 Minutes', '90 Minutes']:
-        return True
-    return False
+def closest(lng, lat):
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] ='/Users/Josh/Desktop/sacramento-parking/config/bqkey.json'
+    bigquery_client = bigquery.Client(project='projects-247703')
+    QUERY = '''
+    SELECT *, ROUND(ST_DISTANCE(ST_GEOGPOINT(lng, lat), ST_GEOGPOINT({}, {})), 3) AS distMeters
+    FROM `projects-247703.sacramento_parking.onstreet`
+    ORDER BY distMeters
+    LIMIT 1
+    '''.format(lng, lat)
+    query_job = bigquery_client.query(QUERY)
+    result = query_job.result().to_dataframe().to_dict(orient='records')[0]
+    for key in ['parking_days', 'sweeping_weeks', 'sweeping_days', 'nopark_days1', 'nopark_days2']:
+        result[key] = string_to_list(result[key])
+    return result
 
-# returns True for parking type violations
-def pkgtype_violation(pkgtype):
-    if pkgtype in ['Red Zone', 'Red Zone (Fire Hydrant)', 'Alley', 'White Zone',
-                   'No Parking Any Time', 'Yellow Zone', 'Fire Hydrant', 'Crosswalk', 'Residential Zone',
-                   'Single Space Meter (Double Space)', 'Crosswalk (No Markings)', 'No Parking Passenger Loading',
-                   'Motorcycle Parking', 'R X R', 'Blue Zone', 'Cross Hatching', 'Taxi Zone', 'Bus Only',
-                   'Official Vehicle Only', 'Construction', 'Fire Lane', 'Passenger Loading Zone', 'Bike Parking']:
-        return True
-    return False
-
-class ParkingSpot:
-    def __init__(self, coord):
-        self.originalCoord = coord
-        self.coordinates = closest(df['COORDINATES'].tolist(), coord)
-        self.all = df[(df['LAT'] == self.coordinates[0]) & (df['LNG'] == self.coordinates[1])].to_dict(orient='records')[0]
-        self.distMeters = distance(coord[0], coord[1], self.coordinates[0], self.coordinates[1]) * 1000
-        self.fullAddress = f"{self.all['ADDRESS']} {self.all['STREET']}{self.all['SUFFIX']} {self.all['PREFIX']}"
-        self.timeLimit = self.all['TIMELIMIT']
-        self.parkingType = self.all['PKGTYPE']
-        self.permitArea = self.all['PERMITAREA']
-        self.eventArea = self.all['EVTAREA']
-        self.timeViolation = self.all['TIMELIMIT_VIOLATION']
-        self.parkingViolation = self.all['PKGTYPE_VIOLATION']
+def spot(lng, lat):
+    result = closest(lng, lat)
+    result['schedule'] = get_all_schedules(result)
+    spot_dict = {}
+    for key in ['address', 'aorb', 'street', 'suffix', 'prefix', 'evenodd', 'aorp', 'permitarea', 'maxrate', 'event_area', 'park_mobile', 'lng', 'lat', 'timeLimit', 'parkingType', 'distMeters', 'schedule']:
+        spot_dict[key] = result[key]
+    return [spot_dict]
